@@ -3,9 +3,17 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictInt,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
 
 MAX_RECORDS_PER_SIDE = 12
 
@@ -136,3 +144,102 @@ class MatchResponse(BaseModel):
     )
     sampling_records: list[RecordVerdictOut]
     detection_records: list[RecordVerdictOut]
+
+
+# ---------------------------------------------------------------------------
+# /redact-counts：阳性计数表遮盖
+# ---------------------------------------------------------------------------
+
+NameStr = Annotated[str, Field(min_length=1, max_length=64)]
+CellCount = Annotated[StrictInt, Field(ge=0, le=9)]
+
+
+class RedactCountsRequest(BaseModel):
+    """遮盖请求：带行列名称的 2~3 行、2~3 列计数矩阵及敏感阈值。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    row_names: list[NameStr] = Field(
+        min_length=2,
+        max_length=3,
+        description="行名（采样点），2~3 个，组内唯一",
+        examples=[["SP-1", "SP-2"]],
+    )
+    column_names: list[NameStr] = Field(
+        min_length=2,
+        max_length=3,
+        description="列名（检测项目），2~3 个，组内唯一",
+        examples=[["T-A", "T-B"]],
+    )
+    counts: list[list[CellCount]] = Field(
+        description=(
+            "计数矩阵：行数须等于 row_names 长度，每行长度须等于 "
+            "column_names 长度；每格为 0~9 的整数"
+        ),
+        examples=[[[2, 5], [6, 7]]],
+    )
+    threshold: StrictInt = Field(
+        ge=2,
+        le=4,
+        description="敏感阈值：大于零且小于阈值的格子必须遮盖",
+        examples=[3],
+    )
+
+    @field_validator("row_names", "column_names")
+    @classmethod
+    def _names_unique(cls, v: list[str], info: ValidationInfo) -> list[str]:
+        if len(v) != len(set(v)):
+            raise ValueError(f"{info.field_name} 内存在重复名称")
+        return v
+
+    @model_validator(mode="after")
+    def _counts_shape_matches_names(self) -> "RedactCountsRequest":
+        if len(self.counts) != len(self.row_names):
+            raise ValueError(
+                f"counts 行数（{len(self.counts)}）须等于 row_names 长度"
+                f"（{len(self.row_names)}）"
+            )
+        for idx, row in enumerate(self.counts):
+            if len(row) != len(self.column_names):
+                raise ValueError(
+                    f"counts 第 {idx} 行长度（{len(row)}）须等于 column_names 长度"
+                    f"（{len(self.column_names)}）"
+                )
+        return self
+
+
+class CellRefOut(BaseModel):
+    """一个被遮盖的格子（只给坐标与名称，绝不含取值）。"""
+
+    row_index: int = Field(description="行下标（从 0 开始）")
+    column_index: int = Field(description="列下标（从 0 开始）")
+    row: str = Field(description="行名")
+    column: str = Field(description="列名")
+
+
+class PublishedCellOut(CellRefOut):
+    """一个可公开的格子及其取值。"""
+
+    value: int = Field(ge=0, le=9, description="可公开的计数")
+
+
+class RedactCountsResponse(BaseModel):
+    """可安全发布的计数表：行列合计 + 可公开格 + 遮盖坐标。
+
+    刻意不区分"敏感格"与"补遮盖格"：阈值为 2 时敏感格取值必为 1，
+    一旦标注类型就等于公开真值。响应中所有遮盖格一视同仁。
+    """
+
+    row_names: list[str]
+    column_names: list[str]
+    threshold: int
+    row_totals: list[int] = Field(description="行合计（与 row_names 同序）")
+    column_totals: list[int] = Field(description="列合计（与 column_names 同序）")
+    grand_total: int = Field(description="全表合计")
+    grid: list[list[int | None]] = Field(
+        description="与输入同形的发布表：整数为可公开格，null 为被遮盖格"
+    )
+    published_cells: list[PublishedCellOut] = Field(description="可公开格及其取值")
+    redacted_cells: list[CellRefOut] = Field(
+        description="被遮盖格坐标（敏感格与补遮盖格不区分，按行优先、列次之排序）"
+    )

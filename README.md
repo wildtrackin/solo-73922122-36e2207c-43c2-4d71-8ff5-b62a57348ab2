@@ -27,6 +27,36 @@
   "部分最优方案中未配对"；
 - `possible_partners`：在至少一个同等最优方案中可行的配对对象及时间差。
 
+## 计数表遮盖（/redact-counts）
+
+数据管理员向合作方发布"采样点 × 检测项目"阳性计数表时，保留行列合计，
+但小计数格不得被反推：
+
+- 输入带行列名称的 **2~3 行、2~3 列**矩阵（每格为 **0~9** 的整数）及阈值（**2~4**）。
+- **大于零且小于阈值的格子必须遮盖**；为保住行列合计，接口会**补遮盖最少的**
+  额外格子。
+- 安全保证：对每个被遮格，公开数字（可公开格 + 行列合计）都容许另一张
+  **各格仍在 0~9、但该格计数不同**的整数矩阵——即它无法被唯一反推。
+- 补遮盖数并列时，取**行优先、列次之字典序最小**的遮盖坐标集合。
+- **无可行方案时返回 422**，且不给出任何部分表格或敏感原值。
+- 响应刻意不区分敏感格与补遮盖格（阈值为 2 时"敏感"标签本身就会泄露真值 1）。
+
+### 请求示例
+
+```bash
+curl -X POST http://localhost:8000/redact-counts \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "row_names": ["SP-1", "SP-2"],
+    "column_names": ["T-A", "T-B", "T-C"],
+    "counts": [[2, 5, 4], [6, 7, 8]],
+    "threshold": 3
+  }'
+```
+
+响应给出 `row_totals` / `column_totals` / `grand_total`、发布表 `grid`
+（`null` 表示被遮盖）、`published_cells` 与 `redacted_cells`（只含坐标与名称）。
+
 ## 快速开始（Docker Compose）
 
 ```bash
@@ -36,11 +66,14 @@ docker compose up --build
 服务监听 `http://localhost:8000`：
 
 - `POST /match` —— 配对接口；
-- `GET /docs` —— Swagger UI，**/match 的 Examples 下拉框内置三组演示请求**：
-  - `duplicate_barcodes`（重复条码）：同条码多条记录，按时间窗唯一锁定；
-  - `crossing_candidates`（交叉候选）：时间窗交叉，贪心最近邻总成本更差；
-  - `equivalent_optima`（等价最优）：两套同等最优方案并存，接口只输出确定配对，
-    其余标记待核查；
+- `POST /redact-counts` —— 计数表遮盖接口；
+- `GET /docs` —— Swagger UI，**/match 与 /redact-counts 的 Examples 下拉框均内置演示请求**：
+  - `/match`：`duplicate_barcodes`（重复条码）、`crossing_candidates`（交叉候选）、
+    `equivalent_optima`（等价最优）；
+  - `/redact-counts`：`secondary_suppression`（只遮敏感格会被反推，需补遮盖）、
+    `no_sensitive_cells`（无敏感格，全表可公开）、
+    `sensitive_rectangle`（敏感格自成矩形，无需补遮盖）、
+    `infeasible_table`（行列合计锁死敏感格，返回 422）；
 - `GET /health` —— 健康检查（Compose healthcheck 使用）。
 
 ### 请求示例
@@ -60,13 +93,25 @@ curl -X POST http://localhost:8000/match \
 
 ## 校验规则（不满足返回 422）
 
+`/match`：
+
 - 每组 0–12 条记录；
 - 同组内 `id` 不得重复；
 - `id`、`barcode` 非空；
 - `timestamp` 必须带时区（带偏移量的时间会归一化为 UTC 再比较）；
 - 不接受未定义的字段。
 
+`/redact-counts`：
+
+- 行名、列名各 2~3 个，组内唯一且非空；
+- 矩阵形状须与行列名数量一致，每格为 0~9 的**整数**（布尔、浮点、字符串一律拒绝）；
+- 阈值为 2~4 的整数；
+- 不接受未定义的字段；
+- 矩阵合法但无法安全发布时同样返回 422（不携带任何计数信息）。
+
 ## 算法说明
+
+### 配对（/match）
 
 建模为二分图最小费用最大流：左部采样记录、右部检测记录，候选边权为时间差
 （毫秒整数）。持续沿最短路增广直到不可增广，即得"配对数最大、同流量下总时间差
@@ -83,6 +128,20 @@ curl -X POST http://localhost:8000/match \
 每组 ≤ 12 条记录时候选边 ≤ 144 条，重算约 200 次微型流，单次请求开销在毫秒级。
 算法结果已用 3000 个随机小规模用例与暴力枚举全部匹配交叉验证一致。
 
+### 遮盖（/redact-counts）
+
+敏感格（0 < 计数 < 阈值）必须遮盖；在其基础上枚举补遮盖集合，
+按"补遮盖数最少、再按遮盖坐标字典序最小"取最优。
+
+安全性判定：遮盖集合可行 ⟺ 对每个被遮格，把未遮格固定为公开值、
+行列合计固定后，该格在 0~9 内仍存在不同于真值的可行取值
+（用带回溯的行列剩余量界剪枝判定；可以证明最优解处"只查敏感格"
+与"查所有遮盖格"等价）。矩阵 ≤ 3×3，候选子集 ≤ 256 个，
+单格判定为微型回溯，一次请求总开销在毫秒级。
+
+算法已用独立暴力枚举交叉验证：2×2 全量 243 个实例、2×3 与 3×3
+随机实例的最优遮盖集均与暴力枚举全部子集的结果一致。
+
 ## 本地开发与测试
 
 ```bash
@@ -98,9 +157,10 @@ uvicorn app.main:app --reload
 app/
   main.py       # FastAPI 入口与响应组装
   matching.py   # 配对核心算法（最小费用最大流 + 确定性判定）
+  redaction.py  # 计数表遮盖核心算法（补遮盖优化 + 可行性回溯）
   schemas.py    # 请求/响应模型与校验
-  examples.py   # /docs 内置的三组演示请求
-tests/          # 算法单元测试与 API 集成测试
+  examples.py   # /docs 内置的演示请求
+tests/          # 算法单元测试、暴力枚举交叉验证与 API 集成测试
 Dockerfile
 docker-compose.yml
 ```

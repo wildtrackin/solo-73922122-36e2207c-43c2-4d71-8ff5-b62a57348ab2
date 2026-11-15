@@ -1,28 +1,33 @@
-"""FastAPI 入口：采样登记 / 仪器检测记录配对服务。"""
+"""FastAPI 入口：采样登记 / 仪器检测记录配对服务 + 阳性计数表遮盖。"""
 
 from __future__ import annotations
 
 from collections import Counter
 from datetime import datetime
 
-from fastapi import Body, FastAPI
+from fastapi import Body, FastAPI, HTTPException
 from fastapi.responses import RedirectResponse
 
-from .examples import DEMO_EXAMPLES
+from .examples import DEMO_EXAMPLES, REDACT_EXAMPLES
 from .matching import Analysis, Record, analyze
+from .redaction import plan_redaction
 from .schemas import (
+    CellRefOut,
     CertainPairOut,
     MatchRequest,
     MatchResponse,
     PartnerOptionOut,
+    PublishedCellOut,
     RecordIn,
     RecordVerdictOut,
+    RedactCountsRequest,
+    RedactCountsResponse,
     StatusCounts,
     SummaryOut,
 )
 
 app = FastAPI(
-    title="采样-检测记录配对服务",
+    title="采样-检测记录配对与计数表遮盖服务",
     description=(
         "把人工采样登记与仪器检测记录按'同条码 + UTC 时间差 ≤ 10 分钟'配对，"
         "每条记录至多用一次；先最大化配对数，再最小化时间差总和。\n\n"
@@ -30,9 +35,15 @@ app = FastAPI(
         "其余记录区分为待核查（review）与始终未配对（unmatched），"
         "不会任选一套最优方案冒充确定结论。\n\n"
         "右侧 `/match` 的 Examples 下拉框内置三组演示请求："
-        "重复条码、交叉候选、等价最优。"
+        "重复条码、交叉候选、等价最优。\n\n"
+        "---\n\n"
+        "`/redact-counts` 面向合作方发布'采样点 × 检测项目'阳性计数表："
+        "大于零且小于阈值的格子必须遮盖，接口在保留行列合计的前提下"
+        "自动补遮盖最少的格子，使每个被遮格都无法被公开数字唯一反推；"
+        "补遮盖数并列时取行优先、列次之字典序最小的遮盖坐标集合；"
+        "无可行方案时返回 422，绝不给出部分表或敏感原值。"
     ),
-    version="1.0.0",
+    version="1.1.0",
 )
 
 
@@ -120,4 +131,69 @@ def match(
         detection_records=[
             _verdict_out(r, analysis, is_sampling=False) for r in request.detection_records
         ],
+    )
+
+
+@app.post(
+    "/redact-counts",
+    response_model=RedactCountsResponse,
+    summary="遮盖阳性计数表中的小计数格",
+    description=(
+        "接收带行列名称的 2~3 行、2~3 列计数矩阵（每格 0~9）及阈值（2~4）。"
+        "大于零且小于阈值的格子必须遮盖；在保留行列合计的前提下，"
+        "接口补遮盖最少的额外格子，使每个被遮格都存在另一张各格仍在 0~9、"
+        "但该格计数不同的可行矩阵（即无法被公开数字唯一反推）；"
+        "补遮盖数并列时取行优先、列次之字典序最小的遮盖坐标集合。"
+        "无可行方案时返回 422，不给出部分表或敏感原值。"
+    ),
+)
+def redact_counts(
+    request: RedactCountsRequest = Body(openapi_examples=REDACT_EXAMPLES),
+) -> RedactCountsResponse:
+    plan = plan_redaction(request.counts, request.threshold)
+    if plan is None:
+        # 拒绝时不携带任何格子取值、行列合计或部分表格，避免泄露敏感原值
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "无法安全发布该表：在当前阈值下，无论怎样补遮盖，"
+                "至少一个敏感格仍能被行列合计唯一反推。"
+                "请合并行/列或调整阈值后重试。"
+            ),
+        )
+
+    n_rows = len(request.row_names)
+    n_cols = len(request.column_names)
+    redacted = plan.redacted
+    grid: list[list[int | None]] = []
+    published: list[PublishedCellOut] = []
+    hidden: list[CellRefOut] = []
+    for i in range(n_rows):
+        grid_row: list[int | None] = []
+        for j in range(n_cols):
+            ref = CellRefOut(
+                row_index=i,
+                column_index=j,
+                row=request.row_names[i],
+                column=request.column_names[j],
+            )
+            if (i, j) in redacted:
+                grid_row.append(None)
+                hidden.append(ref)
+            else:
+                value = request.counts[i][j]
+                grid_row.append(value)
+                published.append(PublishedCellOut(**ref.model_dump(), value=value))
+        grid.append(grid_row)
+
+    return RedactCountsResponse(
+        row_names=request.row_names,
+        column_names=request.column_names,
+        threshold=request.threshold,
+        row_totals=list(plan.row_totals),
+        column_totals=list(plan.column_totals),
+        grand_total=sum(plan.row_totals),
+        grid=grid,
+        published_cells=published,
+        redacted_cells=hidden,
     )

@@ -1,4 +1,8 @@
-"""挂载到 /docs 的演示请求：重复条码、交叉候选、等价最优。"""
+"""挂载到 /docs 的演示请求。
+
+/match：重复条码、交叉候选、等价最优。
+/redact-counts：补遮盖、无敏感格、敏感格自成矩形、不可行拒绝。
+"""
 
 DEMO_EXAMPLES = {
     "duplicate_barcodes": {
@@ -59,6 +63,65 @@ DEMO_EXAMPLES = {
                 {"id": "D-23", "barcode": "BC-500", "timestamp": "2026-11-14T13:03:00Z"},
                 {"id": "D-24", "barcode": "BC-700", "timestamp": "2026-11-14T15:00:00Z"},
             ],
+        },
+    },
+}
+
+REDACT_EXAMPLES = {
+    "secondary_suppression": {
+        "summary": "补遮盖：只遮敏感格会被行/列合计反推，需补遮 3 格",
+        "description": (
+            "阈值 3 下只有 (SP-1, T-A)=2 是敏感格；但 2×3 表中任何被遮格只要"
+            "同行或同列其余格全公开就会被合计唯一锁定，因此最少补遮 3 格，"
+            "使 (SP-1,T-A)、(SP-1,T-B)、(SP-2,T-A)、(SP-2,T-B) 形成遮盖矩形，"
+            "此时敏感格在 0~4 内均有可行补全。"
+        ),
+        "value": {
+            "row_names": ["SP-1", "SP-2"],
+            "column_names": ["T-A", "T-B", "T-C"],
+            "counts": [[2, 5, 4], [6, 7, 8]],
+            "threshold": 3,
+        },
+    },
+    "no_sensitive_cells": {
+        "summary": "无敏感格：没有任何格子落在 (0, 阈值) 区间，全表可公开",
+        "description": (
+            "阈值 3 下，0 与 ≥3 的格子都不是敏感格；本表不含 1 或 2，"
+            "因此无需任何遮盖，行列合计与全部格子都可发布。"
+        ),
+        "value": {
+            "row_names": ["SP-1", "SP-2"],
+            "column_names": ["T-A", "T-B"],
+            "counts": [[0, 5], [7, 9]],
+            "threshold": 3,
+        },
+    },
+    "sensitive_rectangle": {
+        "summary": "敏感格自成矩形：只遮敏感格即安全，无需补遮盖",
+        "description": (
+            "阈值 2 下四个 1 都是敏感格，且恰好构成 2×2 矩形：每个敏感格"
+            "在同行、同列都有另一个被遮格分担自由度，公开数字容许它取 0 或 2，"
+            "因此补遮盖数为 0。"
+        ),
+        "value": {
+            "row_names": ["SP-1", "SP-2", "SP-3"],
+            "column_names": ["T-A", "T-B", "T-C"],
+            "counts": [[1, 1, 5], [1, 1, 5], [5, 5, 5]],
+            "threshold": 2,
+        },
+    },
+    "infeasible_table": {
+        "summary": "不可行：行列合计把敏感格锁死，接口拒绝并返回 422",
+        "description": (
+            "阈值 4 下 (SP-1, T-A)=3 是敏感格；但行合计 12、列合计 3 与单格上限 9 "
+            "共同把它锁定为 3（即使全表遮盖也无法容许其他取值），"
+            "接口返回 422 且不给出任何部分表格或原始计数。"
+        ),
+        "value": {
+            "row_names": ["SP-1", "SP-2"],
+            "column_names": ["T-A", "T-B"],
+            "counts": [[3, 9], [0, 5]],
+            "threshold": 4,
         },
     },
 }
